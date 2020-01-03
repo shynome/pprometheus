@@ -19,13 +19,11 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 	"unsafe"
 
@@ -94,11 +92,6 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("%s: %s", e.typ, e.err)
 }
 
-type alertmanagerRetriever interface {
-	Alertmanagers() []*url.URL
-	DroppedAlertmanagers() []*url.URL
-}
-
 type rulesRetriever interface {
 	RuleGroups() []*rules.Group
 	AlertingRules() []*rules.AlertingRule
@@ -162,12 +155,10 @@ type API struct {
 	Queryable   storage.Queryable
 	QueryEngine *promql.Engine
 
-	alertmanagerRetriever alertmanagerRetriever
-	rulesRetriever        rulesRetriever
-	now                   func() time.Time
-	config                func() config.Config
-	flagsMap              map[string]string
-	ready                 func(http.HandlerFunc) http.HandlerFunc
+	now      func() time.Time
+	config   func() config.Config
+	flagsMap map[string]string
+	ready    func(http.HandlerFunc) http.HandlerFunc
 
 	db                        func() TSDBAdmin
 	enableAdmin               bool
@@ -195,7 +186,6 @@ func NewAPI(
 	db func() TSDBAdmin,
 	enableAdmin bool,
 	logger log.Logger,
-	rr rulesRetriever,
 	remoteReadSampleLimit int,
 	remoteReadConcurrencyLimit int,
 	remoteReadMaxBytesInFrame int,
@@ -212,7 +202,6 @@ func NewAPI(
 		ready:                     readyFunc,
 		db:                        db,
 		enableAdmin:               enableAdmin,
-		rulesRetriever:            rr,
 		remoteReadSampleLimit:     remoteReadSampleLimit,
 		remoteReadGate:            gate.New(remoteReadConcurrencyLimit),
 		remoteReadMaxBytesInFrame: remoteReadMaxBytesInFrame,
@@ -266,9 +255,6 @@ func (api *API) Register(r *route.Router) {
 	r.Get("/status/flags", wrap(api.serveFlags))
 	r.Get("/status/tsdb", wrap(api.serveTSDBStatus))
 	r.Post("/read", api.ready(http.HandlerFunc(api.remoteRead)))
-
-	r.Get("/alerts", wrap(api.alerts))
-	r.Get("/rules", wrap(api.rules))
 
 	// Admin APIs
 	r.Post("/admin/tsdb/delete_series", wrap(api.deleteSeries))
@@ -590,30 +576,6 @@ type metricMetadata struct {
 	Unit   string               `json:"unit"`
 }
 
-// AlertmanagerDiscovery has all the active Alertmanagers.
-type AlertmanagerDiscovery struct {
-	ActiveAlertmanagers  []*AlertmanagerTarget `json:"activeAlertmanagers"`
-	DroppedAlertmanagers []*AlertmanagerTarget `json:"droppedAlertmanagers"`
-}
-
-// AlertmanagerTarget has info on one AM.
-type AlertmanagerTarget struct {
-	URL string `json:"url"`
-}
-
-func (api *API) alertmanagers(r *http.Request) apiFuncResult {
-	urls := api.alertmanagerRetriever.Alertmanagers()
-	droppedURLS := api.alertmanagerRetriever.DroppedAlertmanagers()
-	ams := &AlertmanagerDiscovery{ActiveAlertmanagers: make([]*AlertmanagerTarget, len(urls)), DroppedAlertmanagers: make([]*AlertmanagerTarget, len(droppedURLS))}
-	for i, url := range urls {
-		ams.ActiveAlertmanagers[i] = &AlertmanagerTarget{URL: url.String()}
-	}
-	for i, url := range droppedURLS {
-		ams.DroppedAlertmanagers[i] = &AlertmanagerTarget{URL: url.String()}
-	}
-	return apiFuncResult{ams, nil, nil, nil}
-}
-
 // AlertDiscovery has info for all active alerts.
 type AlertDiscovery struct {
 	Alerts []*Alert `json:"alerts"`
@@ -626,22 +588,6 @@ type Alert struct {
 	State       string        `json:"state"`
 	ActiveAt    *time.Time    `json:"activeAt,omitempty"`
 	Value       string        `json:"value"`
-}
-
-func (api *API) alerts(r *http.Request) apiFuncResult {
-	alertingRules := api.rulesRetriever.AlertingRules()
-	alerts := []*Alert{}
-
-	for _, alertingRule := range alertingRules {
-		alerts = append(
-			alerts,
-			rulesAlertsToAPIAlerts(alertingRule.ActiveAlerts())...,
-		)
-	}
-
-	res := &AlertDiscovery{Alerts: alerts}
-
-	return apiFuncResult{res, nil, nil, nil}
 }
 
 func rulesAlertsToAPIAlerts(rulesAlerts []*rules.Alert) []*Alert {
@@ -706,75 +652,6 @@ type recordingRule struct {
 	LastError string           `json:"lastError,omitempty"`
 	// Type of a recordingRule is always "recording".
 	Type string `json:"type"`
-}
-
-func (api *API) rules(r *http.Request) apiFuncResult {
-	ruleGroups := api.rulesRetriever.RuleGroups()
-	res := &RuleDiscovery{RuleGroups: make([]*RuleGroup, len(ruleGroups))}
-	typeParam := strings.ToLower(r.URL.Query().Get("type"))
-
-	if typeParam != "" && typeParam != "alert" && typeParam != "record" {
-		err := errors.Errorf("invalid query parameter type='%v'", typeParam)
-		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
-	}
-
-	returnAlerts := typeParam == "" || typeParam == "alert"
-	returnRecording := typeParam == "" || typeParam == "record"
-
-	for i, grp := range ruleGroups {
-		apiRuleGroup := &RuleGroup{
-			Name:     grp.Name(),
-			File:     grp.File(),
-			Interval: grp.Interval().Seconds(),
-			Rules:    []rule{},
-		}
-		for _, r := range grp.Rules() {
-			var enrichedRule rule
-
-			lastError := ""
-			if r.LastError() != nil {
-				lastError = r.LastError().Error()
-			}
-			switch rule := r.(type) {
-			case *rules.AlertingRule:
-				if !returnAlerts {
-					break
-				}
-				enrichedRule = alertingRule{
-					State:       rule.State().String(),
-					Name:        rule.Name(),
-					Query:       rule.Query().String(),
-					Duration:    rule.Duration().Seconds(),
-					Labels:      rule.Labels(),
-					Annotations: rule.Annotations(),
-					Alerts:      rulesAlertsToAPIAlerts(rule.ActiveAlerts()),
-					Health:      rule.Health(),
-					LastError:   lastError,
-					Type:        "alerting",
-				}
-			case *rules.RecordingRule:
-				if !returnRecording {
-					break
-				}
-				enrichedRule = recordingRule{
-					Name:      rule.Name(),
-					Query:     rule.Query().String(),
-					Labels:    rule.Labels(),
-					Health:    rule.Health(),
-					LastError: lastError,
-					Type:      "recording",
-				}
-			default:
-				err := errors.Errorf("failed to assert type of rule '%v'", rule.Name())
-				return apiFuncResult{nil, &apiError{errorInternal, err}, nil, nil}
-			}
-			if enrichedRule != nil {
-				apiRuleGroup.Rules = append(apiRuleGroup.Rules, enrichedRule)
-			}
-		}
-		res.RuleGroups[i] = apiRuleGroup
-	}
-	return apiFuncResult{res, nil, nil, nil}
 }
 
 type prometheusConfig struct {

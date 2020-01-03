@@ -31,7 +31,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,7 +56,6 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/prometheus/prometheus/config"
-	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/scrape"
@@ -176,13 +174,10 @@ type Handler struct {
 	gatherer prometheus.Gatherer
 	metrics  *metrics
 
-	scrapeManager *scrape.Manager
-	ruleManager   *rules.Manager
-	queryEngine   *promql.Engine
-	context       context.Context
-	tsdb          func() *tsdb.DB
-	storage       storage.Storage
-	notifier      *notifier.Manager
+	queryEngine *promql.Engine
+	context     context.Context
+	tsdb        func() *tsdb.DB
+	storage     storage.Storage
 
 	apiV1 *api_v1.API
 
@@ -214,16 +209,13 @@ func (h *Handler) ApplyConfig(conf *config.Config) error {
 
 // Options for the web Handler.
 type Options struct {
-	Context       context.Context
-	TSDB          func() *tsdb.DB
-	TSDBCfg       prometheus_tsdb.Options
-	Storage       storage.Storage
-	QueryEngine   *promql.Engine
-	ScrapeManager *scrape.Manager
-	RuleManager   *rules.Manager
-	Notifier      *notifier.Manager
-	Version       *PrometheusVersion
-	Flags         map[string]string
+	Context     context.Context
+	TSDB        func() *tsdb.DB
+	TSDBCfg     prometheus_tsdb.Options
+	Storage     storage.Storage
+	QueryEngine *promql.Engine
+	Version     *PrometheusVersion
+	Flags       map[string]string
 
 	ListenAddress              string
 	CORSOrigin                 *regexp.Regexp
@@ -275,13 +267,10 @@ func New(logger log.Logger, o *Options) *Handler {
 		cwd:         cwd,
 		flagsMap:    o.Flags,
 
-		context:       o.Context,
-		scrapeManager: o.ScrapeManager,
-		ruleManager:   o.RuleManager,
-		queryEngine:   o.QueryEngine,
-		tsdb:          o.TSDB,
-		storage:       o.Storage,
-		notifier:      o.Notifier,
+		context:     o.Context,
+		queryEngine: o.QueryEngine,
+		tsdb:        o.TSDB,
+		storage:     o.Storage,
 
 		now: model.Now,
 
@@ -301,7 +290,6 @@ func New(logger log.Logger, o *Options) *Handler {
 		},
 		h.options.EnableAdminAPI,
 		logger,
-		h.ruleManager,
 		h.options.RemoteReadSampleLimit,
 		h.options.RemoteReadConcurrencyLimit,
 		h.options.RemoteReadBytesInFrame,
@@ -324,15 +312,11 @@ func New(logger log.Logger, o *Options) *Handler {
 		http.Redirect(w, r, path.Join(o.ExternalURL.Path, "/graph"), http.StatusFound)
 	})
 
-	router.Get("/alerts", readyf(h.alerts))
 	router.Get("/graph", readyf(h.graph))
 	router.Get("/status", readyf(h.status))
 	router.Get("/flags", readyf(h.flags))
 	router.Get("/config", readyf(h.serveConfig))
-	router.Get("/rules", readyf(h.rules))
-	router.Get("/targets", readyf(h.targets))
 	router.Get("/version", readyf(h.version))
-	router.Get("/service-discovery", readyf(h.serviceDiscovery))
 
 	router.Get("/metrics", promhttp.Handler().ServeHTTP)
 
@@ -588,27 +572,6 @@ func (h *Handler) Run(ctx context.Context) error {
 	}
 }
 
-func (h *Handler) alerts(w http.ResponseWriter, r *http.Request) {
-
-	var groups []*rules.Group
-	for _, group := range h.ruleManager.RuleGroups() {
-		if group.HasAlertingRules() {
-			groups = append(groups, group)
-		}
-	}
-
-	alertStatus := AlertStatus{
-		Groups: groups,
-		AlertStateToRowClass: map[rules.AlertState]string{
-			rules.StateInactive: "success",
-			rules.StatePending:  "warning",
-			rules.StateFiring:   "danger",
-		},
-		Counts: alertCounts(groups),
-	}
-	h.executeTemplate(w, "alerts.html", alertStatus)
-}
-
 func alertCounts(groups []*rules.Group) AlertByStateCount {
 	result := AlertByStateCount{}
 
@@ -715,7 +678,6 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		Birth               time.Time
 		CWD                 string
 		Version             *PrometheusVersion
-		Alertmanagers       []*url.URL
 		GoroutineCount      int
 		GOMAXPROCS          int
 		GOGC                string
@@ -735,7 +697,6 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		Birth:          h.birth,
 		CWD:            h.cwd,
 		Version:        h.versionInfo,
-		Alertmanagers:  h.notifier.Alertmanagers(),
 		GoroutineCount: runtime.NumGoroutine(),
 		GOMAXPROCS:     runtime.GOMAXPROCS(0),
 		GOGC:           os.Getenv("GOGC"),
@@ -846,71 +807,6 @@ func (h *Handler) serveConfig(w http.ResponseWriter, r *http.Request) {
 	defer h.mtx.RUnlock()
 
 	h.executeTemplate(w, "config.html", h.config.String())
-}
-
-func (h *Handler) rules(w http.ResponseWriter, r *http.Request) {
-	h.executeTemplate(w, "rules.html", h.ruleManager)
-}
-
-func (h *Handler) serviceDiscovery(w http.ResponseWriter, r *http.Request) {
-	var index []string
-	targets := h.scrapeManager.TargetsAll()
-	for job := range targets {
-		index = append(index, job)
-	}
-	sort.Strings(index)
-	scrapeConfigData := struct {
-		Index   []string
-		Targets map[string][]*scrape.Target
-		Active  []int
-		Dropped []int
-		Total   []int
-	}{
-		Index:   index,
-		Targets: make(map[string][]*scrape.Target),
-		Active:  make([]int, len(index)),
-		Dropped: make([]int, len(index)),
-		Total:   make([]int, len(index)),
-	}
-	for i, job := range scrapeConfigData.Index {
-		scrapeConfigData.Targets[job] = make([]*scrape.Target, 0, len(targets[job]))
-		scrapeConfigData.Total[i] = len(targets[job])
-		for _, target := range targets[job] {
-			// Do not display more than 100 dropped targets per job to avoid
-			// returning too much data to the clients.
-			if target.Labels().Len() == 0 {
-				scrapeConfigData.Dropped[i]++
-				if scrapeConfigData.Dropped[i] > 100 {
-					continue
-				}
-			} else {
-				scrapeConfigData.Active[i]++
-			}
-			scrapeConfigData.Targets[job] = append(scrapeConfigData.Targets[job], target)
-		}
-	}
-
-	h.executeTemplate(w, "service-discovery.html", scrapeConfigData)
-}
-
-func (h *Handler) targets(w http.ResponseWriter, r *http.Request) {
-	tps := h.scrapeManager.TargetsActive()
-	for _, targets := range tps {
-		sort.Slice(targets, func(i, j int) bool {
-			iJobLabel := targets[i].Labels().Get(model.JobLabel)
-			jJobLabel := targets[j].Labels().Get(model.JobLabel)
-			if iJobLabel == jJobLabel {
-				return targets[i].Labels().Get(model.InstanceLabel) < targets[j].Labels().Get(model.InstanceLabel)
-			}
-			return iJobLabel < jJobLabel
-		})
-	}
-
-	h.executeTemplate(w, "targets.html", struct {
-		TargetPools map[string][]*scrape.Target
-	}{
-		TargetPools: tps,
-	})
 }
 
 func (h *Handler) version(w http.ResponseWriter, r *http.Request) {
