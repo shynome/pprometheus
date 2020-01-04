@@ -78,21 +78,6 @@
       </tbody>
     </table>
 
-    <h2 id="alertmanagers">Alertmanagers</h2>
-    <table class="table table-sm table-bordered table-striped table-hover">
-      <tbody>
-        <tr>
-           <th>Endpoint</th>
-        </tr>
-        {{range .Alertmanagers}}
-        <tr>
-          {{/* Alertmanager URLs always have Scheme, Host and Path set */}}
-          <td>{{.Scheme}}://<a href="{{.Scheme}}://{{.Host}}">{{.Host}}</a>{{.Path}}</td>
-        </tr>
-        {{end}}
-      </tbody>
-    </table>
-
     <h2 id="headstatus">Head Stats</h2>
     <table class="table table-sm table-bordered table-striped table-hover">
       <tbody>
