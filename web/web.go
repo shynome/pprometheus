@@ -64,6 +64,7 @@ import (
 	"github.com/prometheus/prometheus/template"
 	"github.com/prometheus/prometheus/util/httputil"
 	"github.com/prometheus/prometheus/web/ui"
+	api_push "github.com/shynome/pprometheus/web/api/push"
 	api_v1 "github.com/shynome/pprometheus/web/api/v1"
 	api_v2 "github.com/shynome/pprometheus/web/api/v2"
 )
@@ -524,6 +525,13 @@ func (h *Handler) Run(ctx context.Context) error {
 		return fmt.Sprintf("%s %s", r.Method, r.URL.Path)
 	})
 	mux := http.NewServeMux()
+
+	mux.Handle("/push", &api_push.Server{
+		GetAppender: func() tsdb.Appender {
+			return h.options.TSDB().Appender()
+		},
+	})
+
 	mux.Handle("/", h.router)
 
 	av1 := route.New().WithInstrumentation(h.metrics.instrumentHandlerWithPrefix("/api/v1"))
