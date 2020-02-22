@@ -1,3 +1,5 @@
+## Archive
+push stats has much way to choose, I have choose another, promethus is not good at push
 ## Introduction
 
 change pull way to push, why? because I love promethus tsdb and promql
